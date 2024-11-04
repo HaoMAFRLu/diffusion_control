@@ -1,0 +1,5 @@
+# Ignore the environment
+myenv/
+
+# Ignore the resulting data
+data/
