@@ -1,4 +1,3 @@
-ament-package==0.8.9
 contourpy==1.3.0
 cycler==0.12.1
 filelock==3.16.1

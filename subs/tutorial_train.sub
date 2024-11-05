@@ -1,8 +1,8 @@
 executable = /lustre/home/hma2/projects/diffusion_control/myenv/bin/python
 arguments = -u ../tutorial/train.py
-error  = mnist/task$(Process).err
-output = mnist/task$(Process).out
-log    = mnist/task$(Process).log
+error  = tutorial/task$(Process).err
+output = tutorial/task$(Process).out
+log    = tutorial/task$(Process).log
 request_gpus = 1
 request_memory = 65536
 request_cpus = 1

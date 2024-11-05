@@ -7,22 +7,30 @@ import numpy as np
 import os, sys
 import matplotlib.pyplot as plt
 from scipy import integrate
+from tqdm import tqdm
+from PIL import Image, ImageDraw
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from utils import *
+from barrier_function import BarrierFunction
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def get_gamma(t, a=0.0001, alpha=0.01):
+  return a * (1 - np.exp(-alpha * t))
 
 #@title Define the Euler-Maruyama sampler (double click to expand or collapse)
 
 ## The number of sampling steps.
-num_steps =  500#@param {'type':'integer'}
+num_steps =  1000#@param {'type':'integer'}
 def Euler_Maruyama_sampler(score_model, 
                            marginal_prob_std,
                            diffusion_coeff, 
                            batch_size=64, 
-                           num_steps=num_steps, 
-                           device='cuda', 
-                           eps=1e-3):
+                           num_steps=num_steps,
+                           eps=1e-3,
+                           V=None):
   """Generate samples from score-based models with the Euler-Maruyama solver.
 
   Args:
@@ -44,18 +52,28 @@ def Euler_Maruyama_sampler(score_model,
     * marginal_prob_std(t)[:, None, None, None]
   time_steps = torch.linspace(1., eps, num_steps, device=device)
   step_size = time_steps[0] - time_steps[1]
-  x = init_x
+  x = init_x.clone()
+  x_cons = init_x.clone()
+  nr_it = -1
+
   with torch.no_grad():
-    for time_step in tqdm.notebook.tqdm(time_steps):      
+    for time_step in tqdm(time_steps):
+      nr_it += 1      
       batch_time_step = torch.ones(batch_size, device=device) * time_step
       g = diffusion_coeff(batch_time_step)
+
       mean_x = x + (g**2)[:, None, None, None] * score_model(x, batch_time_step) * step_size
-      x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)      
+      x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)  
+      
+      gamma = 0.001#get_gamma(nr_it)
+      barrier_gradient = V.barrier_gradient(x_cons)
+      mean_x_cons = x_cons + (g**2)[:, None, None, None] * (score_model(x_cons, batch_time_step) + gamma*barrier_gradient)* step_size
+      x_cons = mean_x_cons + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x_cons)      
+  
   # Do not include any noise in the last sampling step.
-  return mean_x
+  return mean_x, mean_x_cons
 
 #@title Define the Predictor-Corrector sampler (double click to expand or collapse)
-
 signal_to_noise_ratio = 0.16 #@param {'type':'number'}
 ## The number of sampling steps.
 num_steps =  500#@param {'type':'integer'}
@@ -64,8 +82,7 @@ def pc_sampler(score_model,
                diffusion_coeff,
                batch_size=64, 
                num_steps=num_steps, 
-               snr=signal_to_noise_ratio,                
-               device='cuda',
+               snr=signal_to_noise_ratio,
                eps=1e-3):
   """Generate samples from score-based models with Predictor-Corrector method.
 
@@ -90,7 +107,7 @@ def pc_sampler(score_model,
   step_size = time_steps[0] - time_steps[1]
   x = init_x
   with torch.no_grad():
-    for time_step in tqdm.notebook.tqdm(time_steps):      
+    for time_step in tqdm(time_steps):      
       batch_time_step = torch.ones(batch_size, device=device) * time_step
       # Corrector step (Langevin MCMC)
       grad = score_model(x, batch_time_step)
@@ -108,8 +125,6 @@ def pc_sampler(score_model,
     return x_mean
   
 #@title Define the ODE sampler (double click to expand or collapse)
-
-
 ## The error tolerance for the black-box ODE solver
 error_tolerance = 1e-5 #@param {'type': 'number'}
 def ode_sampler(score_model,
@@ -118,7 +133,6 @@ def ode_sampler(score_model,
                 batch_size=64, 
                 atol=error_tolerance, 
                 rtol=error_tolerance, 
-                device='cuda', 
                 z=None,
                 eps=1e-3):
   """Generate samples from score-based models with black-box ODE solvers.
@@ -168,28 +182,62 @@ def ode_sampler(score_model,
   return x
 
 ## Load the pre-trained checkpoint from disk.
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 sigma =  25.0#@param {'type':'number'}
 score_model, marginal_prob_std_fn, diffusion_coeff_fn = get_components(sigma)
 
-ckpt = torch.load('ckpt.pth', map_location=device)
+ckpt = torch.load('data/ckpt.pth', map_location=device)
 score_model.load_state_dict(ckpt)
 
 sample_batch_size = 64 #@param {'type':'integer'}
-sampler = ode_sampler #@param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
+sampler = Euler_Maruyama_sampler #@param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
+
+V = BarrierFunction()
 
 ## Generate samples using the specified sampler.
-samples = sampler(score_model, 
-                  marginal_prob_std_fn,
-                  diffusion_coeff_fn, 
-                  sample_batch_size, 
-                  device=device)
+samples, samples_cons = sampler(score_model, 
+                        marginal_prob_std_fn,
+                        diffusion_coeff_fn, 
+                        sample_batch_size,
+                        V=V)
 
 ## Sample visualization.
 samples = samples.clamp(0.0, 1.0)
-sample_grid = make_grid(samples, nrow=int(np.sqrt(sample_batch_size)))
+samples_cons = samples_cons.clamp(0.0, 1.0)
 
-plt.figure(figsize=(6,6))
+processed_images = []
+
+for sample in samples_cons:
+    img = sample.squeeze(0).cpu().numpy() * 255  # 转换为 [0, 255] 的灰度值
+    img = Image.fromarray(img.astype(np.uint8))
+    img = img.convert("RGB")
+
+    draw = ImageDraw.Draw(img)
+    draw.ellipse(
+        [
+            (V.center[0] - V.radius, V.center[1] - V.radius),
+            (V.center[0] + V.radius, V.center[1] + V.radius)
+        ],
+        outline="red", width=1
+    )
+
+    processed_images.append(torch.from_numpy(np.array(img)).permute(2, 0, 1) / 255.0)
+processed_images_tensor = torch.stack(processed_images)
+
+sample_grid1 = make_grid(samples, nrow=int(np.sqrt(sample_batch_size)))
+sample_grid2 = make_grid(processed_images_tensor, nrow=int(np.sqrt(samples.size(0))))
+
+
+plt.figure(figsize=(12, 6)) 
+
+plt.subplot(1, 2, 1)
 plt.axis('off')
-plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
+plt.imshow(sample_grid1.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
+plt.title("Original Samples")
+
+plt.subplot(1, 2, 2)
+plt.axis('off')
+plt.imshow(sample_grid2.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
+plt.title("Samples with Barrier")
+
 plt.show()
